@@ -26,6 +26,7 @@ namespace MSTestX.Console
         private static string? activityName = null;
         private static AdbClient? client;
         private static string? outputFilename;
+        private static string? appLogFilename;
         private static string? settingsXml = null;
         private static LogCatMonitor? monitor;
         private static CancellationTokenSource? processExitCancellationTokenSource;
@@ -40,6 +41,13 @@ namespace MSTestX.Console
                 return LaunchMode.AppleApp;
 
             return LaunchMode.AndroidAdb;
+        }
+
+        internal static string? GetAppLogFilename(string? trxFilename)
+        {
+            return string.IsNullOrWhiteSpace(trxFilename)
+                ? null
+                : Path.ChangeExtension(trxFilename, ".log");
         }
 
         static async Task Main(string[] args)
@@ -223,6 +231,8 @@ iOs specific (MacOS only):
                         string defaultFilename = DateTime.Now.ToString("yyyy-MM-dd_HH_mm_ss");
                         outputFilename = Path.Combine(System.Environment.CurrentDirectory, defaultFilename + ".trx");
                     }
+                    appLogFilename = GetAppLogFilename(outputFilename);
+                    System.Console.WriteLine($"iOS app log file: {appLogFilename}");
 
                     // Set up port forwarding using "mobiledevice"
                     MobileDevice tunnel;
@@ -236,12 +246,31 @@ iOs specific (MacOS only):
                         testRunCompleted.TrySetResult(1);
                         return;
                     }
-                    tunnel.Exited += (s, e) => { testRunCompleted.TrySetResult(1); System.Console.WriteLine("Tunnel process exited."); };
+                    tunnel.Exited += (s, e) =>
+                    {
+                        if (s is MobileDevice mobileDevice && mobileDevice.IsIntentionalShutdown)
+                        {
+                            System.Console.WriteLine("Tunnel process exited after intentional shutdown.");
+                            return;
+                        }
+
+                        testRunCompleted.TrySetResult(1);
+                        System.Console.WriteLine("Tunnel process exited unexpectedly.");
+                    };
 
                     CancellationTokenSource closeAppToken = new CancellationTokenSource();
                     closeAppToken.Token.Register(t => tunnel.Dispose(), null);
-                    var appTask = devicectl.LaunchApp(device, bundleId, "--TestAdapterPort 38300 --AutoExit True", outputFilename.Replace(".trx", ".log"), closeAppToken.Token);
-                    await OnApplicationLaunched(System.Net.IPEndPoint.Parse("127.0.0.1:38300"));
+                    var appTask = devicectl.LaunchApp(device, bundleId, "--TestAdapterPort 38300 --AutoExit True", appLogFilename, closeAppToken.Token);
+                    _ = appTask.ContinueWith(t =>
+                    {
+                        if (t.IsCanceled)
+                            System.Console.WriteLine("iOS app console capture stopped.");
+                        else if (t.Exception != null)
+                            System.Console.WriteLine("iOS app console capture failed: " + t.Exception.GetBaseException().Message);
+                        else
+                            System.Console.WriteLine("iOS app console capture completed.");
+                    });
+                    await OnApplicationLaunched(System.Net.IPEndPoint.Parse("127.0.0.1:38300"), appLogFilename);
                     GC.KeepAlive(tunnel);
                     closeAppToken.Cancel();
                     testRunCompleted.TrySetResult(0);
@@ -423,7 +452,9 @@ iOs specific (MacOS only):
 
         private static bool appLaunchDetected;
 
-        private static async Task OnApplicationLaunched(System.Net.IPEndPoint? endpoint = null)
+        private static async Task OnApplicationLaunched(
+            System.Net.IPEndPoint? endpoint = null,
+            string? appLogFilename = null)
         {
             if (appLaunchDetected)
                 return;
@@ -433,7 +464,7 @@ iOs specific (MacOS only):
             try
             {
                 await Task.Delay(5000); //Give app some time to start up
-                await runner.RunTests(outputFilename, settingsXml, processExitCancellationTokenSource?.Token ?? CancellationToken.None);
+                await runner.RunTests(outputFilename, settingsXml, processExitCancellationTokenSource?.Token ?? CancellationToken.None, appLogFilename);
             }
             catch(System.Exception ex)
             {

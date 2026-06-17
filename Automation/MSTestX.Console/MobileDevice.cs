@@ -12,8 +12,9 @@ namespace MSTestX.Console
     /// </summary>
     internal sealed class MobileDevice : IDisposable
     {
-        private Process mobileDeviceProcess;
+        private Process? mobileDeviceProcess;
         private TaskCompletionSource? tunnelCompletion;
+        private bool isDisposing;
         private MobileDevice()
         {
             if (!OperatingSystem.IsMacOS())
@@ -23,9 +24,30 @@ namespace MSTestX.Console
             mobileDeviceProcess = new Process() { StartInfo = new ProcessStartInfo(path) { RedirectStandardOutput = true, RedirectStandardInput = true, RedirectStandardError = true, UseShellExecute = false } };
             mobileDeviceProcess.EnableRaisingEvents = true;
             mobileDeviceProcess.OutputDataReceived += MobileDeviceProcess_OutputDataReceived;
+            mobileDeviceProcess.ErrorDataReceived += MobileDeviceProcess_ErrorDataReceived;
             mobileDeviceProcess.Exited += MobileDeviceProcess_Exited;
         }
         string? lastMessage = null;
+
+        internal bool IsIntentionalShutdown => isDisposing;
+
+        internal static bool IsUnexpectedTunnelExit(bool isIntentionalShutdown)
+        {
+            return !isIntentionalShutdown;
+        }
+
+        internal static string FormatTunnelExitMessage(
+            int exitCode,
+            string? lastMessage,
+            bool isIntentionalShutdown)
+        {
+            var reason = string.IsNullOrEmpty(lastMessage) ? "" : ". " + lastMessage;
+            if (isIntentionalShutdown)
+                return $"mobiledevice: tunnel stopped intentionally with code {exitCode}{reason}";
+
+            return $"mobiledevice: tunnel exited unexpectedly with code {exitCode}{reason}";
+        }
+
         private void MobileDeviceProcess_OutputDataReceived(object? sender, DataReceivedEventArgs e)
         {
             if (e.Data is null) return;
@@ -41,14 +63,28 @@ namespace MSTestX.Console
             }
         }
 
+        private void MobileDeviceProcess_ErrorDataReceived(object? sender, DataReceivedEventArgs e)
+        {
+            if (e.Data is null) return;
+            lastMessage = e.Data;
+            System.Console.WriteLine("mobiledevice stderr: " + e.Data);
+        }
+
         private void MobileDeviceProcess_Exited(object? sender, EventArgs e)
         {
-            mobileDeviceProcess = null!;
-            Task.Delay(1).ContinueWith(t =>
+            var process = mobileDeviceProcess;
+            if (process is null)
+                return;
+
+            var exitCode = process.ExitCode;
+            var message = FormatTunnelExitMessage(exitCode, lastMessage, isDisposing);
+            System.Console.WriteLine(message);
+            if (IsUnexpectedTunnelExit(isDisposing))
             {
-                tunnelCompletion?.TrySetException(new Exception("MobileDevice exited unexpectedly with code " + mobileDeviceProcess.ExitCode + (string.IsNullOrEmpty(lastMessage) ? "" : ". " + lastMessage)));
-            });
-            Exited?.Invoke(this, mobileDeviceProcess.ExitCode);
+                tunnelCompletion?.TrySetException(new Exception(message));
+            }
+            Exited?.Invoke(this, exitCode);
+            mobileDeviceProcess = null;
         }
 
         private async Task StartTunnelAsync(int fromPort, int toPort, string uuid)
@@ -56,13 +92,16 @@ namespace MSTestX.Console
             Process.Start("pkill", "mobiledevice"); // Ensure mobiledevice isn't already running
             await Task.Delay(100);
             tunnelCompletion = new TaskCompletionSource();
-            mobileDeviceProcess.StartInfo.Arguments = $"tunnel -u {uuid} {fromPort} {toPort}";
+            var completion = tunnelCompletion;
+            var process = mobileDeviceProcess ?? throw new ObjectDisposedException(nameof(MobileDevice));
+            process.StartInfo.Arguments = $"tunnel -u {uuid} {fromPort} {toPort}";
             CancellationTokenSource tcs = new CancellationTokenSource();
             tcs.CancelAfter(5000);
-            tcs.Token.Register(() => tunnelCompletion.TrySetException(new TimeoutException()));
-            mobileDeviceProcess.Start();
-            mobileDeviceProcess.BeginOutputReadLine();
-            await tunnelCompletion.Task;
+            tcs.Token.Register(() => completion.TrySetException(new TimeoutException()));
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            await completion.Task;
         }
 
         public static async Task<MobileDevice> CreateTunnelAsync(int fromPort, int toPort, string uuid)
@@ -74,12 +113,14 @@ namespace MSTestX.Console
 
         public void Dispose()
         {
+            isDisposing = true;
             if (mobileDeviceProcess != null && !mobileDeviceProcess.HasExited)
             {
+                System.Console.WriteLine("mobiledevice: stopping tunnel intentionally.");
                 mobileDeviceProcess.Kill(true);
             }
             mobileDeviceProcess?.Dispose();
-            mobileDeviceProcess = null!;
+            mobileDeviceProcess = null;
         }
 
         ~MobileDevice()

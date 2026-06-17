@@ -14,10 +14,99 @@ using System.Threading.Tasks;
 
 namespace MSTestX.Console
 {
+    internal sealed class TestRunDiagnostics
+    {
+        public TestRunDiagnostics(string appLogPath)
+        {
+            AppLogPath = string.IsNullOrWhiteSpace(appLogPath) ? "(none)" : appLogPath;
+        }
+
+        public string Phase { get; private set; } = "starting";
+        public int SelectedTestCount { get; private set; }
+        public int ResultCount { get; private set; }
+        public string LastTestResult { get; private set; } = "(none)";
+        public string LastReceivedMessage { get; private set; } = "(none)";
+        public string LastException { get; private set; } = "(none)";
+        public bool ExecutionCompleteReceived { get; private set; }
+        public string AppLogPath { get; }
+
+        public void SetPhase(string phase)
+        {
+            Phase = string.IsNullOrWhiteSpace(phase) ? "(unknown)" : phase;
+        }
+
+        public void RecordSelectedTests(int count)
+        {
+            SelectedTestCount = count;
+        }
+
+        public void RecordMessage(string messageType)
+        {
+            LastReceivedMessage = string.IsNullOrWhiteSpace(messageType)
+                ? "(none)"
+                : messageType;
+            if (messageType == MessageType.ExecutionComplete)
+                ExecutionCompleteReceived = true;
+        }
+
+        public void RecordResult(string testName, string outcome, TimeSpan duration)
+        {
+            ResultCount++;
+            LastTestResult = string.Format(
+                "{0} {1} {2}",
+                string.IsNullOrWhiteSpace(outcome) ? "(unknown)" : outcome,
+                string.IsNullOrWhiteSpace(testName) ? "(unnamed test)" : testName,
+                duration.FormatDuration());
+        }
+
+        public void RecordException(System.Exception exception)
+        {
+            LastException = exception?.GetType().Name + ": " + exception?.Message;
+        }
+
+        public string FormatAbortSummary()
+        {
+            return string.Join("; ", new[]
+            {
+                "MSTestX abort: adapter disconnected before ExecutionComplete",
+                $"phase={Phase}",
+                $"selectedTests={SelectedTestCount}",
+                $"results={ResultCount}",
+                $"lastResult={LastTestResult}",
+                $"lastMessage={LastReceivedMessage}",
+                $"executionCompleteReceived={ExecutionCompleteReceived}",
+                $"appLog={AppLogPath}",
+                $"lastException={LastException}"
+            });
+        }
+    }
+
+    internal sealed class TestRunAbortedException : Exception
+    {
+        public TestRunAbortedException(
+            TestRunDiagnostics diagnostics,
+            Exception innerException)
+            : base(diagnostics.FormatAbortSummary(), innerException)
+        {
+            Diagnostics = diagnostics;
+        }
+
+        public TestRunDiagnostics Diagnostics { get; }
+    }
+
+    internal sealed class TestRunCompletedWithErrorException : Exception
+    {
+        public TestRunCompletedWithErrorException(TestRunCompleteEventArgs completion)
+            : base(TestRunner.FormatCompletionFailureMessage(completion))
+        {
+        }
+    }
+
     public class TestRunner : IDisposable
     {
         private SocketCommunicationManager socket;
         private System.Net.IPEndPoint _endpoint;
+        private TestRunDiagnostics diagnostics = new TestRunDiagnostics(null);
 
         internal static string GetRedirectedOutcomeLabel(Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome outcome)
         {
@@ -57,13 +146,52 @@ namespace MSTestX.Console
             return ShouldWriteTestResult(parentExecId, isOutputRedirected) && !string.IsNullOrEmpty(testMessage);
         }
 
+        internal static bool IsDisconnectBeforeExecutionComplete(TestRunDiagnostics diagnostics)
+        {
+            return diagnostics != null && !diagnostics.ExecutionCompleteReceived;
+        }
+
+        internal static long GetOutcomeCount(
+            ITestRunStatistics statistics,
+            Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome outcome)
+        {
+            if (statistics?.Stats == null)
+                return 0;
+
+            return statistics.Stats.TryGetValue(outcome, out var count) ? count : 0;
+        }
+
+        internal static bool IsUnsuccessfulCompletion(TestRunCompleteEventArgs completion)
+        {
+            return completion?.Error != null
+                || completion?.IsAborted == true
+                || completion?.IsCanceled == true;
+        }
+
+        internal static string FormatCompletionFailureMessage(TestRunCompleteEventArgs completion)
+        {
+            if (completion?.Error != null)
+                return "Test run completed with error: " + completion.Error.Message;
+            if (completion?.IsAborted == true)
+                return "Test run completed as aborted.";
+            if (completion?.IsCanceled == true)
+                return "Test run completed as canceled.";
+
+            return "Test run completed successfully.";
+        }
+
         public TestRunner(System.Net.IPEndPoint endpoint = null)
         {
             _endpoint = endpoint;
         }
 
-        public async Task RunTests(string outputFilename, string settingsXml, CancellationToken cancellationToken)
+        public async Task RunTests(
+            string outputFilename,
+            string settingsXml,
+            CancellationToken cancellationToken,
+            string appLogFilename = null)
         {
+            diagnostics = new TestRunDiagnostics(appLogFilename);
             var loggerEvents = new TestLoggerEventsImpl();
             var logger = new Microsoft.VisualStudio.TestPlatform.Extensions.TrxLogger.TrxLogger();
             var parameters = new Dictionary<string, string>() { { "TestRunDirectory", "." } };
@@ -74,7 +202,11 @@ namespace MSTestX.Console
             {
                 await RunTestsInternal(outputFilename, settingsXml, loggerEvents, cancellationToken);
             }
-            catch
+            catch (TestRunCompletedWithErrorException)
+            {
+                throw;
+            }
+            catch (TestRunAbortedException)
             {
                 if (loggerEvents != null)
                 {
@@ -83,14 +215,25 @@ namespace MSTestX.Console
                 }
                 throw;
             }
+            catch (System.Exception ex)
+            {
+                if (loggerEvents != null)
+                {
+                    var result = new TestRunCompleteEventArgs(null, false, true, null, null, TimeSpan.Zero); //TRXLogger doesn't use these values anyway
+                    loggerEvents?.OnTestRunComplete(result);
+                }
+                diagnostics.RecordException(ex);
+                throw;
+            }
             finally
             {
-                socket.StopClient();
+                socket?.StopClient();
             }
         }
 
         private async Task RunTestsInternal(string outputFilename, string settingsXml, TestLoggerEventsImpl loggerEvents, CancellationToken cancellationToken)
         {
+            diagnostics.SetPhase("connecting to test adapter");
             System.Console.WriteLine("Waiting for connection to test adapter...");
             for (int i = 1; i <= 10; i++)
             {
@@ -113,6 +256,7 @@ namespace MSTestX.Console
             socket.SendMessage(MessageType.SessionConnected); //Start session
 
             //Perform version handshake
+            diagnostics.SetPhase("waiting for version check");
             Message msg = await ReceiveMessageAsync(cancellationToken);
             if (msg?.MessageType == MessageType.VersionCheck)
             {
@@ -126,6 +270,7 @@ namespace MSTestX.Console
             }
 
             // Get tests
+            diagnostics.SetPhase("requesting discovery");
             socket.SendMessage(MessageType.StartDiscovery,
                 new DiscoveryRequestPayload()
                 {
@@ -153,20 +298,24 @@ namespace MSTestX.Console
                 }
                 else if (msg.MessageType == MessageType.DiscoveryInitialize)
                 {
+                    diagnostics.SetPhase("discovering tests");
                     System.Console.Write("Discovering tests...");
                     loggerEvents?.OnDiscoveryStart(new DiscoveryStartEventArgs(new DiscoveryCriteria()));
                 }
                 else if (msg.MessageType == MessageType.DiscoveryComplete)
                 {
                     var dcp = JsonDataSerializer.Instance.DeserializePayload<DiscoveryCompletePayload>(msg);
+                    var selectedTests = dcp.LastDiscoveredTests.ToList();
+                    diagnostics.RecordSelectedTests(selectedTests.Count);
+                    diagnostics.SetPhase("running tests");
                     System.Console.WriteLine($"Discovered {dcp.TotalTests} tests");
 
                     loggerEvents?.OnDiscoveryComplete(new DiscoveryCompleteEventArgs(dcp.TotalTests, false));
-                    loggerEvents?.OnDiscoveredTests(new DiscoveredTestsEventArgs(dcp.LastDiscoveredTests));
+                    loggerEvents?.OnDiscoveredTests(new DiscoveredTestsEventArgs(selectedTests));
                     //Start testrun
                     socket.SendMessage(MessageType.TestRunSelectedTestCasesDefaultHost,
-                        new TestRunRequestPayload() { TestCases = dcp.LastDiscoveredTests.ToList(), RunSettings = settingsXml });
-                    loggerEvents?.OnTestRunStart(new TestRunStartEventArgs(new TestRunCriteria(dcp.LastDiscoveredTests, 1)));
+                        new TestRunRequestPayload() { TestCases = selectedTests, RunSettings = settingsXml });
+                    loggerEvents?.OnTestRunStart(new TestRunStartEventArgs(new TestRunCriteria(selectedTests, 1)));
                 }
                 else if (msg.MessageType == MessageType.DataCollectionTestStart)
                 {
@@ -195,6 +344,7 @@ namespace MSTestX.Console
                     var testName = tr.GetDisplayName();
 
                     var outcome = tr.TestResult.Outcome;
+                    diagnostics.RecordResult(testName, outcome.ToString(), tr.TestResult.Duration);
 
                     var parentExecId = tr.GetParentExecId();
                     if (outcome == Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed)
@@ -291,19 +441,34 @@ namespace MSTestX.Console
                 }
                 else if (msg.MessageType == MessageType.ExecutionComplete)
                 {
+                    diagnostics.SetPhase("processing execution complete");
                     var trc = JsonDataSerializer.Instance.DeserializePayload<TestRunCompletePayload>(msg);
                     loggerEvents?.OnTestRunComplete(trc.TestRunCompleteArgs);
+                    var statistics = trc.LastRunTests?.TestRunStatistics ?? trc.TestRunCompleteArgs?.TestRunStatistics;
+                    var elapsedTime = trc.TestRunCompleteArgs?.ElapsedTimeInRunningTests ?? TimeSpan.Zero;
+                    var unsuccessfulCompletion = IsUnsuccessfulCompletion(trc.TestRunCompleteArgs);
+                    if (trc.TestRunCompleteArgs?.Error != null)
+                    {
+                        diagnostics.RecordException(trc.TestRunCompleteArgs.Error);
+                        System.Console.ForegroundColor = ConsoleColor.Red;
+                        System.Console.WriteLine($"Run error: {trc.TestRunCompleteArgs.Error.Message}");
+                        System.Console.ResetColor();
+                    }
                     System.Console.WriteLine();
                     System.Console.WriteLine("Test Run Complete");
-                    System.Console.WriteLine($"Total tests: {trc.LastRunTests.TestRunStatistics.ExecutedTests} tests");
+                    System.Console.WriteLine($"Total tests: {statistics?.ExecutedTests ?? 0} tests");
                     System.Console.ForegroundColor = ConsoleColor.Green;
-                    System.Console.WriteLine($"     Passed : {trc.LastRunTests.TestRunStatistics.Stats[Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Passed]} ");
+                    System.Console.WriteLine($"     Passed : {GetOutcomeCount(statistics, Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Passed)} ");
                     System.Console.ForegroundColor = ConsoleColor.Red;
-                    System.Console.WriteLine($"     Failed : {trc.LastRunTests.TestRunStatistics.Stats[Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed]} ");
+                    System.Console.WriteLine($"     Failed : {GetOutcomeCount(statistics, Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed)} ");
                     System.Console.ForegroundColor = ConsoleColor.Yellow;
-                    System.Console.WriteLine($"    Skipped : {trc.LastRunTests.TestRunStatistics.Stats[Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Skipped]} ");
+                    System.Console.WriteLine($"    Skipped : {GetOutcomeCount(statistics, Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Skipped)} ");
                     System.Console.ResetColor(); 
-                    System.Console.WriteLine($" Total time: {trc.TestRunCompleteArgs.ElapsedTimeInRunningTests.TotalSeconds} Seconds");
+                    System.Console.WriteLine($" Total time: {elapsedTime.TotalSeconds} Seconds");
+                    diagnostics.SetPhase(unsuccessfulCompletion ? "complete with error" : "complete");
+                    if (unsuccessfulCompletion)
+                        throw new TestRunCompletedWithErrorException(trc.TestRunCompleteArgs);
+
                     return; //Test run is complete -> Exit message loop
                 }
                 else if (msg.MessageType == MessageType.AbortTestRun)
@@ -357,12 +522,14 @@ namespace MSTestX.Console
                         cancellationToken.ThrowIfCancellationRequested();
                         if (msg != null)
                         {
+                            diagnostics.RecordMessage(msg.MessageType);
                             return msg;
                         }
                     }
                     catch (EndOfStreamException endofStreamException)
                     {
-                        throw new Exception("Test run is aborted.", endofStreamException);
+                        diagnostics.SetPhase("adapter disconnected");
+                        throw new TestRunAbortedException(diagnostics, endofStreamException);
                     }
                     catch (IOException ioException)
                     {

@@ -401,6 +401,42 @@ namespace TestAppRunner.ViewModels
             }
         }
 
+        internal async Task<IEnumerable<TestResult>> RunFromRemoteAdapter(IEnumerable<TestCase> testCollection, IRunSettings runSettings)
+        {
+            if (IsBusy)
+                throw new InvalidOperationException("Can't begin a test run while another is in progress");
+            try
+            {
+                var runOutcome = await Run_Internal(testCollection, runSettings, CancellationToken.None, allowTerminate: false);
+                if (runOutcome.ExecutionFailed)
+                    throw new InvalidOperationException("Remote adapter test run failed before completion.");
+
+                return runOutcome.Results;
+            }
+            catch (System.Exception ex)
+            {
+                Logger.Log($"Remote adapter test run failed: {ex.Message}\nStack trace: {ex.StackTrace}");
+                OnTestRunException?.Invoke(this, ex);
+                throw;
+            }
+        }
+
+        internal void TerminateAfterRemoteAdapterCompletion()
+        {
+            if (Settings.TerminateAfterExecution)
+            {
+                LogLifecycle("terminating after remote adapter completion");
+                Terminate();
+            }
+        }
+
+        internal static void LogLifecycle(string message)
+        {
+            var line = "MSTestX app: " + message;
+            Console.WriteLine(line);
+            Trace.TraceInformation(line);
+        }
+
         public async Task<IEnumerable<TestResult>> RunUntilFailure(IEnumerable<TestCase> testCollection, IRunSettings runSettings, CancellationToken cancellationToken)
         {
             if (IsBusy)
@@ -489,6 +525,7 @@ namespace TestAppRunner.ViewModels
         private async Task<(IEnumerable<TestResult> Results, bool ExecutionFailed)> Run_Internal(IEnumerable<TestCase> testCollection, IRunSettings runSettings, CancellationToken cancellationToken, bool allowTerminate = true)
         {
             var selectedTests = testCollection.OrderBy(tst => tst.FullyQualifiedName).ToArray();
+            LogLifecycle($"run started: selectedTests={selectedTests.Length}");
             HostApp?.RaiseTestRunStarted(testCollection);
             var t = tcs = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             isStopRequested = false;
@@ -544,11 +581,13 @@ namespace TestAppRunner.ViewModels
                 {
                     Status = $"Test run completed.";
                 }
+                LogLifecycle($"run completed: status={Status}");
             }
             catch (System.Exception ex)
             {
                 executionFailed = true;
                 Status = $"Test run failed to run: {ex.Message}";
+                LogLifecycle($"run failed: {ex.Message}");
             }
             DateTime end = DateTime.Now;
             foreach (var item in selectedTests)
@@ -609,6 +648,7 @@ namespace TestAppRunner.ViewModels
             Logger.Log($"COMPLETED TESTRUN Total:{childResults.Count()} Failed:{childResults.Where(a => a.Outcome == TestOutcome.Failed).Count()} Passed:{childResults.Where(a => a.Outcome == TestOutcome.Passed).Count()}  Skipped:{childResults.Where(a => a.Outcome == TestOutcome.Skipped).Count()}");
             if (allowTerminate && Settings.TerminateAfterExecution)
             {
+                LogLifecycle("terminating after direct run completion");
                 Terminate();
             }
             tcs.Dispose();

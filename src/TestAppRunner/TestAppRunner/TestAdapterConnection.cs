@@ -24,10 +24,12 @@ namespace TestAppRunner
 
         public async Task StartAsync()
         {
+            LogLifecycle($"adapter listening on port {port}");
             var server = comm.HostServer(new System.Net.IPEndPoint(System.Net.IPAddress.Any, port));
             await comm.AcceptClientAsync();
+            LogLifecycle("client connected");
             isConnected = true;
-            var tcs = new TaskCompletionSource<object>();
+            var tcs = new TaskCompletionSource<object?>();
             messageLoopThread = new System.Threading.Thread(() => StartMessageLoop(tcs));
             messageLoopThread.Start();
             await tcs.Task;
@@ -90,6 +92,7 @@ namespace TestAppRunner
                 {
                     if (message.MessageType == MessageType.SessionConnected)
                     {
+                        LogLifecycle("session connected; sending version check");
                         // Version Check
                         comm.SendMessage(MessageType.VersionCheck, 1);
                         tcs.TrySetResult(null);
@@ -105,6 +108,7 @@ namespace TestAppRunner
                         var req = comm.DeserializePayload<DiscoveryRequestPayload>(message);
                         comm.SendMessage(MessageType.DiscoveryInitialize);
                         var tests = ViewModels.TestRunnerVM.Instance.Tests;
+                        LogLifecycle($"discovery complete: tests={tests.Count()}");
                         comm.SendMessage(MessageType.DiscoveryComplete, new
                             DiscoveryCompletePayload() { LastDiscoveredTests = tests.Select(t => t.Test), TotalTests = tests.Count() });
                     }
@@ -115,47 +119,7 @@ namespace TestAppRunner
                         if (trr.TestCases != null)
                         {
                             var testsToRun = ViewModels.TestRunnerVM.Instance.Tests.Select(t => t.Test).Where(t => trr.TestCases.Any(t2 => t2.Id == t.Id)).ToList();
-                            DateTime start = DateTime.Now;                            
-                            var _ = ViewModels.TestRunnerVM.Instance.Run(testsToRun, new SettingsXmlImpl(ViewModels.TestRunnerVM.Instance.Settings.AppendParameters(trr.RunSettings))).ContinueWith(task =>
-                              {
-                                  TimeSpan elapsedTime = DateTime.Now - start;
-                                  if (task.IsCanceled)
-                                  {
-                                      SendMessage(MessageType.CancelTestRun);
-                                  }
-                                  else if (task.Exception != null)
-                                  {
-                                      SendMessage(MessageType.TestMessage, new TestMessagePayload { MessageLevel = TestMessageLevel.Error, Message = task.Exception.ToString() });
-                                      var runCompletePayload = new TestRunCompletePayload()
-                                      {
-                                          TestRunCompleteArgs = new TestRunCompleteEventArgs(null, false, true, task.Exception, null, TimeSpan.MinValue),
-                                          LastRunTests = null
-                                      };
-                                      SendMessage(MessageType.ExecutionComplete, runCompletePayload);
-                                  }
-                                  else
-                                  {
-                                      var results = task.Result;
-                                      var stats = new Dictionary<TestOutcome, long>()
-                                        {
-                                            { TestOutcome.Passed, results.Where(t => t.Outcome == TestOutcome.Passed).Count() },
-                                            { TestOutcome.Failed, results.Where(t => t.Outcome == TestOutcome.Failed).Count() },
-                                            { TestOutcome.Skipped, results.Where(t => t.Outcome == TestOutcome.Skipped).Count() },
-                                            { TestOutcome.NotFound, results.Where(t => t.Outcome == TestOutcome.NotFound).Count() },
-                                            { TestOutcome.None, results.Where(t => t.Outcome == TestOutcome.None).Count() }
-                                        };
-
-                                      var testRunStats = new TestRunStatistics(results.Count(), stats);
-                                      var payload = new TestRunCompletePayload()
-                                      {
-                                          LastRunTests = new TestRunChangedEventArgs(testRunStats, results, testsToRun),
-                                          RunAttachments = new List<AttachmentSet>(),
-                                          TestRunCompleteArgs = new TestRunCompleteEventArgs(testRunStats, false, false, null, new System.Collections.ObjectModel.Collection<AttachmentSet>(), elapsedTime)
-                                      };
-                                      SendMessage(MessageType.ExecutionComplete, payload);
-
-                                  }
-                              });
+                            _ = RunRemoteTestsAsync(testsToRun, trr.RunSettings);
                         }
                     }
                     else
@@ -166,6 +130,111 @@ namespace TestAppRunner
             }
             comm.StopServer();
             _ = StartAsync();
+        }
+
+        private async Task RunRemoteTestsAsync(List<TestCase> testsToRun, string? runSettings)
+        {
+            DateTime start = DateTime.Now;
+            LogLifecycle($"run request received: tests={testsToRun.Count}");
+            try
+            {
+                var settings = new SettingsXmlImpl(ViewModels.TestRunnerVM.Instance.Settings.AppendParameters(runSettings));
+                var results = (await ViewModels.TestRunnerVM.Instance.RunFromRemoteAdapter(testsToRun, settings)).ToList();
+                TimeSpan elapsedTime = DateTime.Now - start;
+                LogLifecycle($"run completed: results={results.Count}");
+
+                var stats = new Dictionary<TestOutcome, long>()
+                {
+                    { TestOutcome.Passed, results.Where(t => t.Outcome == TestOutcome.Passed).Count() },
+                    { TestOutcome.Failed, results.Where(t => t.Outcome == TestOutcome.Failed).Count() },
+                    { TestOutcome.Skipped, results.Where(t => t.Outcome == TestOutcome.Skipped).Count() },
+                    { TestOutcome.NotFound, results.Where(t => t.Outcome == TestOutcome.NotFound).Count() },
+                    { TestOutcome.None, results.Where(t => t.Outcome == TestOutcome.None).Count() }
+                };
+
+                var testRunStats = new TestRunStatistics(results.Count(), stats);
+                var payload = new TestRunCompletePayload()
+                {
+                    LastRunTests = new TestRunChangedEventArgs(testRunStats, results, testsToRun),
+                    RunAttachments = new List<AttachmentSet>(),
+                    TestRunCompleteArgs = new TestRunCompleteEventArgs(testRunStats, false, false, null, new System.Collections.ObjectModel.Collection<AttachmentSet>(), elapsedTime)
+                };
+                TrySendExecutionComplete(payload);
+            }
+            catch (OperationCanceledException)
+            {
+                LogLifecycle("run canceled; sending CancelTestRun");
+                TrySendMessage(MessageType.CancelTestRun);
+            }
+            catch (Exception ex)
+            {
+                LogLifecycle($"run failed: {ex}");
+                TrySendMessage(MessageType.TestMessage, new TestMessagePayload { MessageLevel = TestMessageLevel.Error, Message = ex.ToString() });
+                var runCompletePayload = new TestRunCompletePayload()
+                {
+                    TestRunCompleteArgs = new TestRunCompleteEventArgs(null, false, true, ex, null, TimeSpan.MinValue),
+                    LastRunTests = null
+                };
+                TrySendExecutionComplete(runCompletePayload);
+            }
+            finally
+            {
+                ViewModels.TestRunnerVM.Instance.TerminateAfterRemoteAdapterCompletion();
+            }
+        }
+
+        private void SendExecutionComplete(TestRunCompletePayload payload)
+        {
+            LogLifecycle("sending ExecutionComplete");
+            SendMessage(MessageType.ExecutionComplete, payload);
+            LogLifecycle("sent ExecutionComplete");
+        }
+
+        private bool TrySendExecutionComplete(TestRunCompletePayload payload)
+        {
+            try
+            {
+                SendExecutionComplete(payload);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogLifecycle($"failed to send ExecutionComplete: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool TrySendMessage(string messageType)
+        {
+            try
+            {
+                SendMessage(messageType);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogLifecycle($"failed to send {messageType}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool TrySendMessage(string messageType, object payload)
+        {
+            try
+            {
+                SendMessage(messageType, payload);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogLifecycle($"failed to send {messageType}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static void LogLifecycle(string message)
+        {
+            ViewModels.TestRunnerVM.LogLifecycle(message);
         }
 
         internal void SendMessage(string messageType, object payload)

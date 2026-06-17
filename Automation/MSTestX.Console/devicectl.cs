@@ -50,7 +50,7 @@ namespace MSTestX.Console
 
         public static Task LaunchApp(string deviceId, string appId, string? arguments = null, string? stdOutputFile = null, CancellationToken token = default)
         {
-            return DeviceCtl($"device process launch --device {deviceId} --terminate-existing --console {appId} {arguments}", token);
+            return DeviceCtl($"device process launch --device {deviceId} --terminate-existing --console {appId} {arguments}", token, stdOutputFile);
         }
 
         private static async Task<T> DeviceCtl<T>(string arguments, CancellationToken cancellationToken)
@@ -75,33 +75,70 @@ namespace MSTestX.Console
             xcrun.StartInfo.RedirectStandardError = true;
             xcrun.StartInfo.RedirectStandardOutput = true;
             StringBuilder sb = new StringBuilder();
+            object outputLock = new object();
+            PrepareOutputFile(stdOutputFile);
             
             xcrun.Exited += (s, e) =>
             {
+                var output = SnapshotProcessOutput(sb, outputLock);
                 if(xcrun.ExitCode > 0)
-                    tcs.TrySetException(new Exception( sb.ToString()));
+                    tcs.TrySetException(new Exception(output));
                 else
-                    tcs.TrySetResult(sb.ToString());
+                    tcs.TrySetResult(output);
             };
             xcrun.ErrorDataReceived += (s, e) =>
             {
                 if(e.Data is null)
                     return;
-                if (stdOutputFile != null)
-                    File.AppendAllText(stdOutputFile, e.Data + Environment.NewLine);
+                AppendProcessOutput(sb, outputLock, stdOutputFile, e.Data);
             };
             xcrun.OutputDataReceived += (s,e) =>
             {
                 Debug.WriteLine(e.Data);
-                sb.AppendLine(e.Data);
-                if (stdOutputFile != null)
-                    File.AppendAllText(stdOutputFile, e.Data + Environment.NewLine);
+                AppendProcessOutput(sb, outputLock, stdOutputFile, e.Data);
             };
             xcrun.Start();
             xcrun.BeginErrorReadLine();
             xcrun.BeginOutputReadLine();
 
             return tcs.Task;
+        }
+
+        private static void PrepareOutputFile(string? outputFile)
+        {
+            if (string.IsNullOrWhiteSpace(outputFile))
+                return;
+
+            var directory = Path.GetDirectoryName(outputFile);
+            if (!string.IsNullOrEmpty(directory))
+                Directory.CreateDirectory(directory);
+
+            File.WriteAllText(outputFile, "");
+        }
+
+        private static void AppendProcessOutput(
+            StringBuilder output,
+            object outputLock,
+            string? outputFile,
+            string? data)
+        {
+            if (data is null)
+                return;
+
+            lock (outputLock)
+            {
+                output.AppendLine(data);
+                if (!string.IsNullOrWhiteSpace(outputFile))
+                    File.AppendAllText(outputFile, data + Environment.NewLine);
+            }
+        }
+
+        private static string SnapshotProcessOutput(StringBuilder output, object outputLock)
+        {
+            lock (outputLock)
+            {
+                return output.ToString();
+            }
         }
 
     }

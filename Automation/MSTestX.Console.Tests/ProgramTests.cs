@@ -82,4 +82,48 @@ public class ProgramTests
         Assert.AreEqual("NONE", TestRunner.GetRedirectedOutcomeLabel(TestOutcome.None));
         Assert.AreEqual("NOTFOUND", TestRunner.GetRedirectedOutcomeLabel(TestOutcome.NotFound));
     }
+
+    [TestMethod]
+    public void GetAppLogFilename_UsesSiblingLogFile()
+    {
+        Assert.AreEqual("/tmp/results/run.log", Program.GetAppLogFilename("/tmp/results/run.trx"));
+    }
+
+    [TestMethod]
+    public void GetAppLogFilename_ReturnsNull_WhenTrxPathIsMissing()
+    {
+        Assert.IsNull(Program.GetAppLogFilename(null));
+        Assert.IsNull(Program.GetAppLogFilename(""));
+    }
+
+    [TestMethod]
+    public void MobileDevice_IsUnexpectedTunnelExit_ReturnsFalse_ForIntentionalShutdown()
+    {
+        Assert.IsFalse(MobileDevice.IsUnexpectedTunnelExit(isIntentionalShutdown: true));
+        Assert.IsTrue(MobileDevice.IsUnexpectedTunnelExit(isIntentionalShutdown: false));
+    }
+
+    [TestMethod]
+    public void MobileDevice_FormatTunnelExitMessage_LabelsIntentionalShutdown()
+    {
+        var message = MobileDevice.FormatTunnelExitMessage(
+            exitCode: 0,
+            lastMessage: "closed by test runner",
+            isIntentionalShutdown: true);
+
+        StringAssert.Contains(message, "stopped intentionally");
+        StringAssert.Contains(message, "closed by test runner");
+    }
+
+    [TestMethod]
+    public void MobileDevice_FormatTunnelExitMessage_LabelsUnexpectedExit()
+    {
+        var message = MobileDevice.FormatTunnelExitMessage(
+            exitCode: 1,
+            lastMessage: "lost connection",
+            isIntentionalShutdown: false);
+
+        StringAssert.Contains(message, "exited unexpectedly");
+        StringAssert.Contains(message, "lost connection");
+    }
 }
