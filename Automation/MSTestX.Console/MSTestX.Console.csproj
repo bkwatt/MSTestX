@@ -11,7 +11,7 @@
     <ToolCommandName>mstestx.console</ToolCommandName>
     <PackageOutputPath>../../nupkg</PackageOutputPath>
     <GeneratePackageOnBuild Condition="'$(Configuration)'=='Release'">true</GeneratePackageOnBuild>
-    <Version>0.41.0</Version>
+    <Version>0.42.0</Version>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <OutputPath>bin\</OutputPath>
     <Authors>Morten Nielsen</Authors>
