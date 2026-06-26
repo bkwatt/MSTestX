@@ -16,8 +16,8 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <PackageTags>Unit Test, Xamarin, Android, iOS, Test, Testing, MSTest, VSTest, TestFX, TRX, MAUI</PackageTags>
-    <AssemblyVersion>2.0.1.0</AssemblyVersion>
-    <FileVersion>2.0.1.0</FileVersion>
+    <AssemblyVersion>2.0.2.0</AssemblyVersion>
+    <FileVersion>2.0.2.0</FileVersion>
     <Version>$(MSTextXRunnerVersion)</Version>
     <Description>A .NET MAUI-based UnitTest Runner to execute MSTests on Android, iOS and MacCatalyst. The app supports custom test logging, and has built-in support for outputting a TRX test report and being remote controlled from commandline.</Description>
     <IncludeSymbols>true</IncludeSymbols>
